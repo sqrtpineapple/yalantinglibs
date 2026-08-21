@@ -22,6 +22,7 @@
 #include <asio/post.hpp>
 #include <asio/steady_timer.hpp>
 #include <atomic>
+#include <cerrno>
 #include <cstddef>
 #include <cstdint>
 #include <future>
@@ -214,6 +215,12 @@ class io_context_pool {
       return;
     }
 
+#ifdef __linux__
+    std::vector<uint32_t> cpu_ids;
+    const bool apply_cpu_affinity =
+        cpu_affinity_ && get_available_cpus(cpu_ids);
+#endif
+
     std::vector<std::shared_ptr<std::thread>> threads;
     for (std::size_t i = 0; i < io_contexts_.size(); ++i) {
       threads.emplace_back(std::make_shared<std::thread>(
@@ -225,10 +232,10 @@ class io_context_pool {
           io_contexts_[i]));
 
 #ifdef __linux__
-      if (cpu_affinity_) {
+      if (apply_cpu_affinity) {
         cpu_set_t cpuset;
         CPU_ZERO(&cpuset);
-        CPU_SET(i, &cpuset);
+        CPU_SET(cpu_ids[i % cpu_ids.size()], &cpuset);
 
 #ifdef __ANDROID__
         const pid_t tid = pthread_gettid_np(threads.back()->native_handle());
@@ -305,6 +312,33 @@ class io_context_pool {
  private:
   using io_context_ptr = std::shared_ptr<asio::io_context>;
   using work_ptr = std::shared_ptr<asio::io_context::work>;
+
+#ifdef __linux__
+  static bool get_available_cpus(std::vector<uint32_t> &ids) {
+    cpu_set_t set;
+    CPU_ZERO(&set);
+    ids.clear();
+
+    if (sched_getaffinity(0, sizeof(set), &set) != 0) {
+      std::cerr << "Error calling sched_getaffinity: " << errno
+                << "; CPU affinity is disabled.\n";
+      return false;
+    }
+
+    for (uint32_t i = 0; i < CPU_SETSIZE; ++i) {
+      if (CPU_ISSET(i, &set)) {
+        ids.emplace_back(i);
+      }
+    }
+
+    if (ids.empty()) {
+      std::cerr << "No available CPUs found; CPU affinity is disabled.\n";
+      return false;
+    }
+
+    return true;
+  }
+#endif
 
   std::vector<io_context_ptr> io_contexts_;
   std::vector<std::unique_ptr<coro_io::ExecutorWrapper<>>> executors;
