@@ -18,6 +18,7 @@
 #include <async_simple/Traits.h>
 #include <async_simple/coro/FutureAwaiter.h>
 
+#include <atomic>
 #include <cstdint>
 #include <cstdio>
 #include <filesystem>
@@ -45,6 +46,7 @@
 #include <vector>
 
 #include "coro_io.hpp"
+#include "shared_file_handle.hpp"
 #if defined(ASIO_WINDOWS)
 #include <io.h>
 #endif
@@ -402,6 +404,29 @@ using coro_file = basic_seq_coro_file<>;
 
 template <execution_type execute_type = execution_type::native_async>
 class basic_random_coro_file {
+ private:
+  struct file_state {
+    file_state(shared_file_handle file_handle,
+               asio::io_context::executor_type file_executor)
+        : handle(std::move(file_handle)), executor(file_executor) {}
+
+    ~file_state() noexcept {
+#if defined(ASIO_HAS_FILE)
+      if (async_random_file && async_random_file->is_open()) {
+        std::error_code ec;
+        (void)async_random_file->release(ec);
+      }
+#endif
+    }
+
+    shared_file_handle handle;
+    asio::io_context::executor_type executor;
+#if defined(ASIO_HAS_FILE)
+    std::unique_ptr<asio::random_access_file> async_random_file;
+#endif
+    std::atomic<bool> eof{false};
+  };
+
  public:
   basic_random_coro_file(coro_io::ExecutorWrapper<> *executor =
                              coro_io::get_global_block_executor())
@@ -424,110 +449,152 @@ class basic_random_coro_file {
     open(filepath, open_flags);
   }
 
+  basic_random_coro_file(
+      shared_file_handle handle,
+      coro_io::ExecutorWrapper<> *executor =
+          coro_io::get_global_block_executor(),
+      std::string_view file_path = "")
+      : basic_random_coro_file(std::move(handle),
+                               executor->get_asio_executor(), file_path) {}
+
+  basic_random_coro_file(shared_file_handle handle,
+                         asio::io_context::executor_type executor,
+                         std::string_view file_path = "")
+      : executor_wrapper_(executor), file_path_(file_path) {
+    initialize_state(std::move(handle));
+  }
+
   bool open(std::string_view filepath, std::ios::ios_base::openmode open_flags,
             bool use_direct_io = false) {
     file_path_ = std::string{filepath};
-    if constexpr (execute_type == execution_type::thread_pool) {
-      return open_fd(filepath, to_flags(open_flags), use_direct_io);
+    if (load_state()) {
+      return true;
     }
-    else {
-#if defined(ASIO_HAS_FILE)
-      return open_native_async_file<false>(async_random_file_,
-                                           executor_wrapper_, filepath,
-                                           to_flags(open_flags), use_direct_io);
-#else
-      return open_fd(filepath, to_flags(open_flags), use_direct_io);
+
+    int native_flags = to_flags(open_flags);
+#if defined(ASIO_WINDOWS)
+    native_flags = adjust_flags(native_flags);
+#elif defined(__linux__)
+    if (use_direct_io) {
+      native_flags |= O_DIRECT;
+    }
 #endif
+
+    auto [ec, handle] = shared_file_handle::open(filepath, native_flags);
+    if (ec) {
+      return false;
     }
+
+#if defined(__APPLE__) || defined(__MACH__)
+    if (use_direct_io &&
+        fcntl(handle.native_handle(), F_NOCACHE, 1) != 0) {
+      return false;
+    }
+#endif
+
+    return initialize_state(std::move(handle));
   }
 
   async_simple::coro::Lazy<std::pair<std::error_code, size_t>> async_read_at(
       uint64_t offset, char *buf, size_t size) {
+    auto state = load_state();
+    if (!state) {
+      co_return bad_file_descriptor_result();
+    }
+
     if constexpr (execute_type == execution_type::thread_pool) {
-      co_return co_await async_pread(offset, buf, size);
+      co_return co_await async_pread(std::move(state), offset, buf, size);
     }
     else {
 #if defined(ASIO_HAS_FILE)
-      if (async_random_file_ == nullptr) {
-        co_return std::make_pair(
-            std::make_error_code(std::errc::invalid_argument), 0);
-      }
       auto [ec, read_size] = co_await coro_io::async_read_at(
-          offset, *async_random_file_, asio::buffer(buf, size));
+          offset, *state->async_random_file, asio::buffer(buf, size));
 
       if (ec == asio::error::eof) {
-        eof_ = true;
+        state->eof.store(true, std::memory_order_relaxed);
         co_return std::make_pair(std::error_code{}, read_size);
       }
 
       co_return std::make_pair(ec, read_size);
 #else
-      co_return co_await async_pread(offset, buf, size);
+      co_return co_await async_pread(std::move(state), offset, buf, size);
 #endif
     }
   }
 
   async_simple::coro::Lazy<std::pair<std::error_code, size_t>> async_write_at(
       uint64_t offset, std::string_view buf) {
+    auto state = load_state();
+    if (!state) {
+      co_return bad_file_descriptor_result();
+    }
+
     if constexpr (execute_type == execution_type::thread_pool) {
-      co_return co_await async_pwrite(offset, buf.data(), buf.size());
+      co_return co_await async_pwrite(std::move(state), offset, buf.data(),
+                                     buf.size());
     }
     else {
 #if defined(ASIO_HAS_FILE)
-      if (async_random_file_ == nullptr) {
-        co_return std::make_pair(
-            std::make_error_code(std::errc::invalid_argument), 0);
-      }
       auto [ec, write_size] = co_await coro_io::async_write_at(
-          offset, *async_random_file_, asio::buffer(buf));
+          offset, *state->async_random_file, asio::buffer(buf));
 
       co_return std::make_pair(ec, write_size);
 #else
-      co_return co_await async_pwrite(offset, buf.data(), buf.size());
+      co_return co_await async_pwrite(std::move(state), offset, buf.data(),
+                                     buf.size());
 #endif
     }
   }
 
 #if defined(ASIO_HAS_FILE)
   std::shared_ptr<asio::random_access_file> get_async_stream_file() {
-    return async_random_file_;
+    auto state = load_state();
+    if (!state || !state->async_random_file) {
+      return {};
+    }
+    auto *async_random_file = state->async_random_file.get();
+    return {state, async_random_file};
   }
 #endif
-
-  std::shared_ptr<int> get_pread_file() { return prw_random_file_; }
 
   bool is_open() {
+    auto state = load_state();
+    if (!state || !state->handle.valid()) {
+      return false;
+    }
+
 #if defined(ASIO_HAS_FILE)
-    if (async_random_file_ && async_random_file_->is_open()) {
-      return true;
+    if constexpr (execute_type == execution_type::native_async) {
+      return state->async_random_file && state->async_random_file->is_open();
     }
 #endif
-    return prw_random_file_ != nullptr;
+    return true;
   }
 
-  bool eof() { return eof_; }
+  bool eof() {
+    auto state = load_state();
+    return state && state->eof.load(std::memory_order_relaxed);
+  }
 
   execution_type get_execution_type() {
-#if defined(ASIO_HAS_FILE)
-    if (async_random_file_ && async_random_file_->is_open()) {
-      return execution_type::native_async;
-    }
-#endif
-    if (prw_random_file_ != nullptr) {
-      return execution_type::thread_pool;
+    auto state = load_state();
+    if (!state) {
+      return execution_type::none;
     }
 
-    return execution_type::none;
+#if defined(ASIO_HAS_FILE)
+    if constexpr (execute_type == execution_type::native_async) {
+      return state->async_random_file && state->async_random_file->is_open()
+                 ? execution_type::native_async
+                 : execution_type::none;
+    }
+#endif
+    return execution_type::thread_pool;
   }
 
-  void close() {
-#if defined(ASIO_HAS_FILE)
-    std::error_code ec;
-    if (async_random_file_) {
-      async_random_file_->close(ec);
-    }
-#endif
-    prw_random_file_ = nullptr;
+  void close() noexcept {
+    (void)std::atomic_exchange_explicit(
+        &state_, std::shared_ptr<file_state>{}, std::memory_order_acq_rel);
   }
 
   size_t file_size(std::error_code ec) const noexcept {
@@ -539,51 +606,51 @@ class basic_random_coro_file {
   std::string_view file_path() const { return file_path_; }
 
  private:
-  bool open_fd(std::string_view filepath, int open_flags,
-               bool use_direct_io = false) {
-    if (prw_random_file_) {
-      return true;
-    }
-
-    if (use_direct_io) {
-#if defined(ASIO_WINDOWS)
-#elif defined(__linux__)
-      open_flags |= O_DIRECT;
-#endif
-    }
-
-#if defined(ASIO_WINDOWS)
-    int fd = _open(filepath.data(), adjust_flags(open_flags));
-#else
-    int fd = ::open(filepath.data(), open_flags);
-#endif
-    if (fd < 0) {
+  bool initialize_state(shared_file_handle handle) {
+    if (!handle.valid()) {
       return false;
     }
 
-    // On macOS, use F_NOCACHE as an alternative to O_DIRECT
-    if (use_direct_io) {
-#if defined(__APPLE__) || defined(__MACH__)
-      if (fcntl(fd, F_NOCACHE, 1) != 0) {
-        ::close(fd);
-        return false;
+    try {
+      auto state = std::make_shared<file_state>(
+          std::move(handle), executor_wrapper_.get_asio_executor());
+#if defined(ASIO_HAS_FILE)
+      if constexpr (execute_type == execution_type::native_async) {
+        state->async_random_file = std::make_unique<asio::random_access_file>(
+            state->executor);
+        std::error_code ec;
+#if defined(ASIO_WINDOWS)
+        auto native_handle = reinterpret_cast<
+            asio::random_access_file::native_handle_type>(
+            _get_osfhandle(state->handle.native_handle()));
+        state->async_random_file->assign(native_handle, ec);
+#else
+        state->async_random_file->assign(state->handle.native_handle(), ec);
+#endif
+        if (ec) {
+          return false;
+        }
       }
 #endif
+      std::atomic_store_explicit(&state_, std::move(state),
+                                 std::memory_order_release);
+      return true;
+    } catch (...) {
+      return false;
     }
-
-    prw_random_file_ = std::shared_ptr<int>(new int(fd), [](int *ptr) {
-#if defined(ASIO_WINDOWS)
-      _close(*ptr);
-#else
-      ::close(*ptr);
-#endif
-      delete ptr;
-    });
-    return true;
   }
 
-  async_simple::coro::Lazy<std::pair<std::error_code, size_t>> async_pread(
-      size_t offset, char *data, size_t size) {
+  std::shared_ptr<file_state> load_state() const noexcept {
+    return std::atomic_load_explicit(&state_, std::memory_order_acquire);
+  }
+
+  static std::pair<std::error_code, size_t> bad_file_descriptor_result() {
+    return {std::make_error_code(std::errc::bad_file_descriptor), 0};
+  }
+
+  static async_simple::coro::Lazy<std::pair<std::error_code, size_t>>
+  async_pread(std::shared_ptr<file_state> state, size_t offset, char *data,
+              size_t size) {
 #if defined(ASIO_WINDOWS)
     auto pread = [](int fd, void *buf, uint64_t count,
                     uint64_t offset) -> int64_t {
@@ -601,12 +668,19 @@ class basic_random_coro_file {
 
       return bytes_read;
     };
+#else
+    auto pread = [](int fd, void *buf, uint64_t count,
+                    uint64_t offset) -> int64_t {
+      return ::pread(fd, buf, count, offset);
+    };
 #endif
-    co_return co_await async_prw(pread, true, offset, data, size);
+    co_return co_await async_prw(std::move(state), pread, true, offset, data,
+                                 size);
   }
 
-  async_simple::coro::Lazy<std::pair<std::error_code, size_t>> async_pwrite(
-      size_t offset, const char *data, size_t size) {
+  static async_simple::coro::Lazy<std::pair<std::error_code, size_t>>
+  async_pwrite(std::shared_ptr<file_state> state, size_t offset,
+               const char *data, size_t size) {
 #if defined(ASIO_WINDOWS)
     auto pwrite = [](int fd, const void *buf, uint64_t count,
                      uint64_t offset) -> int64_t {
@@ -624,36 +698,38 @@ class basic_random_coro_file {
 
       return bytes_write;
     };
+#else
+    auto pwrite = [](int fd, const void *buf, uint64_t count,
+                     uint64_t offset) -> int64_t {
+      return ::pwrite(fd, buf, count, offset);
+    };
 #endif
-    co_return co_await async_prw(pwrite, false, offset, (char *)data, size);
+    co_return co_await async_prw(std::move(state), pwrite, false, offset,
+                                 const_cast<char *>(data), size);
   }
 
-  async_simple::coro::Lazy<std::pair<std::error_code, size_t>> async_prw(
-      auto io_func, bool is_read, size_t offset, char *buf, size_t size) {
-    std::function<int()> func = [=, this] {
-      int fd = *prw_random_file_;
-      return io_func(fd, buf, size, offset);
-    };
+  static async_simple::coro::Lazy<std::pair<std::error_code, size_t>>
+  async_prw(std::shared_ptr<file_state> state, auto io_func, bool is_read,
+            size_t offset, char *buf, size_t size) {
+    auto executor = state->executor;
+    auto result = co_await coro_io::post(
+        [state, io_func, offset, buf, size]() {
+          auto length = io_func(state->handle.native_handle(), buf, size,
+                                offset);
+          if (length < 0) {
+            return std::make_pair(
+                std::make_error_code(std::errc::io_error), size_t{0});
+          }
+          return std::make_pair(std::error_code{},
+                                static_cast<size_t>(length));
+        },
+        executor);
 
-    std::error_code ec{};
-    size_t op_size = 0;
-
-    auto len_val = co_await coro_io::post(std::move(func), &executor_wrapper_);
-    int len = len_val.value();
-    if (len == 0) {
-      if (is_read) {
-        eof_ = true;
-      }
+    auto operation_result = result.value();
+    if (is_read && !operation_result.first && operation_result.second == 0) {
+      state->eof.store(true, std::memory_order_relaxed);
     }
-    else if (len > 0) {
-      op_size = len;
-    }
-    else {
-      ec = std::make_error_code(std::errc::io_error);
-      op_size = len;
-    }
-
-    co_return std::make_pair(ec, op_size);
+    co_return operation_result;
   }
 
 #if defined(ASIO_WINDOWS)
@@ -691,12 +767,8 @@ class basic_random_coro_file {
 #endif
 
   coro_io::ExecutorWrapper<> executor_wrapper_;
-#if defined(ASIO_HAS_FILE)
-  std::shared_ptr<asio::random_access_file> async_random_file_;  // random file
-#endif
-  std::shared_ptr<int> prw_random_file_ = nullptr;  // pread/pwrite random file
+  std::shared_ptr<file_state> state_;
   std::string file_path_;
-  bool eof_ = false;
 };
 
 using random_coro_file = basic_random_coro_file<>;
