@@ -2,6 +2,7 @@ set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/output/tests)
 add_executable(coro_io_test
         test_io_context_pool.cpp
         test_corofile.cpp
+        test_shared_file_handle.cpp
         test_load_balancer.cpp
         test_client_pool.cpp
         test_rate_limiter.cpp
@@ -16,4 +17,3 @@ add_test(NAME coro_io_test COMMAND coro_io_test)
 
 add_subdirectory(ibverbs)
 add_subdirectory(networkdirect)
-

@@ -594,8 +594,7 @@ class basic_random_coro_file {
   }
 
   void close() noexcept {
-    (void)std::atomic_exchange_explicit(
-        &state_, std::shared_ptr<file_state>{}, std::memory_order_acq_rel);
+    (void)state_.exchange({}, std::memory_order_acq_rel);
   }
 
   size_t file_size(std::error_code ec) const noexcept {
@@ -633,8 +632,7 @@ class basic_random_coro_file {
         }
       }
 #endif
-      std::atomic_store_explicit(&state_, std::move(state),
-                                 std::memory_order_release);
+      state_.store(std::move(state), std::memory_order_release);
       return true;
     } catch (...) {
       return false;
@@ -642,7 +640,7 @@ class basic_random_coro_file {
   }
 
   std::shared_ptr<file_state> load_state() const noexcept {
-    return std::atomic_load_explicit(&state_, std::memory_order_acquire);
+    return state_.load(std::memory_order_acquire);
   }
 
   static std::pair<std::error_code, size_t> bad_file_descriptor_result() {
@@ -769,7 +767,7 @@ class basic_random_coro_file {
 #endif
 
   coro_io::ExecutorWrapper<> executor_wrapper_;
-  std::shared_ptr<file_state> state_;
+  std::atomic<std::shared_ptr<file_state>> state_;
   std::string file_path_;
 };
 
