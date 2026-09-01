@@ -23,6 +23,7 @@
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <span>
 
 #include "async_simple/coro/SyncAwait.h"
@@ -712,7 +713,7 @@ class basic_random_coro_file {
   async_prw(std::shared_ptr<file_state> state, auto io_func, bool is_read,
             size_t offset, char *buf, size_t size) {
     auto executor = state->executor;
-    auto result = co_await coro_io::post(
+    std::function<std::pair<std::error_code, size_t>()> operation =
         [state, io_func, offset, buf, size]() {
           auto length = io_func(state->handle.native_handle(), buf, size,
                                 offset);
@@ -722,8 +723,9 @@ class basic_random_coro_file {
           }
           return std::make_pair(std::error_code{},
                                 static_cast<size_t>(length));
-        },
-        executor);
+        };
+    auto result =
+        co_await coro_io::post(std::move(operation), std::move(executor));
 
     auto operation_result = result.value();
     if (is_read && !operation_result.first && operation_result.second == 0) {
