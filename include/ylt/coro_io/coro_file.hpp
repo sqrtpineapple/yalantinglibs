@@ -547,17 +547,6 @@ class basic_random_coro_file {
     }
   }
 
-#if defined(ASIO_HAS_FILE)
-  std::shared_ptr<asio::random_access_file> get_async_stream_file() {
-    auto state = load_state();
-    if (!state || !state->async_random_file) {
-      return {};
-    }
-    auto *async_random_file = state->async_random_file.get();
-    return {state, async_random_file};
-  }
-#endif
-
   bool is_open() {
     auto state = load_state();
     if (!state || !state->handle.valid()) {
