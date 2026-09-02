@@ -2,8 +2,8 @@
 #include <async_simple/coro/SyncAwait.h>
 #include <doctest.h>
 
-#include <asio/io_context.hpp>
 #include <array>
+#include <asio/io_context.hpp>
 #include <filesystem>
 #include <fstream>
 #include <memory>
@@ -13,7 +13,6 @@
 #include <thread>
 #include <utility>
 #include <vector>
-
 #include <ylt/coro_io/coro_file.hpp>
 #include <ylt/coro_io/shared_file_handle.hpp>
 
@@ -52,7 +51,9 @@ class io_context_runner {
   explicit io_context_runner(asio::io_context &io_context)
       : io_context_(io_context),
         work_(std::make_unique<asio::io_context::work>(io_context_)),
-        thread_([this] { io_context_.run(); }) {}
+        thread_([this] {
+          io_context_.run();
+        }) {}
 
   ~io_context_runner() {
     work_.reset();
@@ -92,9 +93,9 @@ void check_inflight_operation_retains_handle() {
   test_file source("shared_file_handle_inflight.tmp", content);
   test_file pressure("shared_file_handle_pressure.tmp", "other file");
 
-  auto [open_ec, handle] =
-      coro_io::shared_file_handle::open(source.path(), O_RDONLY);
-  REQUIRE_FALSE(open_ec);
+  auto open_result = coro_io::shared_file_handle::open(source.path(), O_RDONLY);
+  REQUIRE_FALSE(open_result.first);
+  auto handle = std::move(open_result.second);
   REQUIRE(handle.valid());
   const int fd = handle.native_handle();
 
@@ -141,9 +142,10 @@ TEST_CASE("shared_file_handle lifetime and factories") {
   test_file source("shared_file_handle_factories.tmp", "shared handle");
 
   SUBCASE("open and weak handle") {
-    auto [ec, handle] =
+    auto open_result =
         coro_io::shared_file_handle::open(source.path(), O_RDONLY);
-    REQUIRE_FALSE(ec);
+    REQUIRE_FALSE(open_result.first);
+    auto handle = std::move(open_result.second);
     REQUIRE(handle.valid());
 
     const int fd = handle.native_handle();
@@ -174,8 +176,9 @@ TEST_CASE("shared_file_handle lifetime and factories") {
   SUBCASE("duplicate") {
     int fd = ::open(source.path().c_str(), O_RDONLY);
     REQUIRE(fd >= 0);
-    auto [ec, handle] = coro_io::shared_file_handle::duplicate(fd);
-    REQUIRE_FALSE(ec);
+    auto duplicate_result = coro_io::shared_file_handle::duplicate(fd);
+    REQUIRE_FALSE(duplicate_result.first);
+    auto handle = std::move(duplicate_result.second);
     REQUIRE(handle.valid());
     const int duplicated_fd = handle.native_handle();
     CHECK(duplicated_fd != fd);
@@ -187,19 +190,19 @@ TEST_CASE("shared_file_handle lifetime and factories") {
   }
 
   SUBCASE("open failure") {
-    auto [ec, handle] = coro_io::shared_file_handle::open(
+    auto open_result = coro_io::shared_file_handle::open(
         "shared_file_handle_missing/file", O_RDONLY);
-    CHECK(ec);
-    CHECK_FALSE(handle.valid());
+    CHECK(open_result.first);
+    CHECK_FALSE(open_result.second.valid());
   }
 }
 
 TEST_CASE("thread pool wrappers share one file descriptor") {
   const std::string content = "0123456789abcdefghijklmnopqrstuvwxyz";
   test_file source("shared_file_handle_thread_pool.tmp", content);
-  auto [open_ec, handle] =
-      coro_io::shared_file_handle::open(source.path(), O_RDONLY);
-  REQUIRE_FALSE(open_ec);
+  auto open_result = coro_io::shared_file_handle::open(source.path(), O_RDONLY);
+  REQUIRE_FALSE(open_result.first);
+  auto handle = std::move(open_result.second);
   const int fd = handle.native_handle();
 
   asio::io_context io_context;
@@ -236,19 +239,19 @@ TEST_CASE("thread pool wrappers share one file descriptor") {
 
 TEST_CASE("closed random_coro_file rejects new operations") {
   test_file source("shared_file_handle_closed.tmp", "closed");
-  auto [open_ec, handle] =
-      coro_io::shared_file_handle::open(source.path(), O_RDONLY);
-  REQUIRE_FALSE(open_ec);
+  auto open_result = coro_io::shared_file_handle::open(source.path(), O_RDONLY);
+  REQUIRE_FALSE(open_result.first);
+  auto handle = std::move(open_result.second);
 
   coro_io::basic_random_coro_file<coro_io::execution_type::thread_pool> file(
       handle);
   file.close();
 
   char buffer{};
-  auto [read_ec, read_size] =
+  auto read_result =
       async_simple::coro::syncAwait(file.async_read_at(0, &buffer, 1));
-  CHECK(read_ec == std::errc::bad_file_descriptor);
-  CHECK(read_size == 0);
+  CHECK(read_result.first == std::errc::bad_file_descriptor);
+  CHECK(read_result.second == 0);
 }
 
 TEST_CASE("thread pool operation retains handle after wrapper destruction") {
@@ -266,9 +269,9 @@ TEST_CASE("native async wrappers share one file descriptor") {
   }
   test_file source("shared_file_handle_native_async.tmp", content);
 
-  auto [open_ec, handle] =
-      coro_io::shared_file_handle::open(source.path(), O_RDONLY);
-  REQUIRE_FALSE(open_ec);
+  auto open_result = coro_io::shared_file_handle::open(source.path(), O_RDONLY);
+  REQUIRE_FALSE(open_result.first);
+  auto handle = std::move(open_result.second);
   const int fd = handle.native_handle();
 
   asio::io_context io_context;
@@ -277,10 +280,8 @@ TEST_CASE("native async wrappers share one file descriptor") {
   using random_file =
       coro_io::basic_random_coro_file<coro_io::execution_type::native_async>;
   std::vector<std::unique_ptr<random_file>> files;
-  std::vector<std::string> buffers(wrapper_count,
-                                   std::string(read_size, '\0'));
-  std::vector<
-      async_simple::coro::Lazy<std::pair<std::error_code, size_t>>>
+  std::vector<std::string> buffers(wrapper_count, std::string(read_size, '\0'));
+  std::vector<async_simple::coro::Lazy<std::pair<std::error_code, size_t>>>
       operations;
   for (size_t index = 0; index < wrapper_count; ++index) {
     files.push_back(std::make_unique<random_file>(
@@ -293,14 +294,13 @@ TEST_CASE("native async wrappers share one file descriptor") {
   CHECK(count_file_descriptors_for_file(fd) == 1);
 #endif
 
-  auto results =
-      async_simple::coro::syncAwait(async_simple::coro::collectAll(
-          std::move(operations)));
+  auto results = async_simple::coro::syncAwait(
+      async_simple::coro::collectAll(std::move(operations)));
   REQUIRE(results.size() == wrapper_count);
   for (size_t index = 0; index < wrapper_count; ++index) {
-    auto [read_ec, bytes_read] = results[index].value();
-    CHECK_FALSE(read_ec);
-    CHECK(bytes_read == read_size);
+    auto read_result = results[index].value();
+    CHECK_FALSE(read_result.first);
+    CHECK(read_result.second == read_size);
     CHECK(buffers[index] ==
           std::string(read_size, static_cast<char>('A' + index)));
   }

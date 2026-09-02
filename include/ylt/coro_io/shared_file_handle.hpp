@@ -1,13 +1,13 @@
 #pragma once
 
+#include <fcntl.h>
+
 #include <cerrno>
 #include <memory>
 #include <string>
 #include <string_view>
 #include <system_error>
 #include <utility>
-
-#include <fcntl.h>
 #if defined(_WIN32)
 #include <io.h>
 #else
@@ -31,8 +31,7 @@ class shared_file_handle {
     try {
       std::string null_terminated_path(path);
 #if defined(_WIN32)
-      fd = ::_open(null_terminated_path.c_str(), flags,
-                   _S_IREAD | _S_IWRITE);
+      fd = ::_open(null_terminated_path.c_str(), flags, _S_IREAD | _S_IWRITE);
 #else
       fd = ::open(null_terminated_path.c_str(), flags,
                   S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP | S_IROTH | S_IWOTH);
