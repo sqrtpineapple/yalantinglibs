@@ -450,13 +450,12 @@ class basic_random_coro_file {
     open(filepath, open_flags);
   }
 
-  basic_random_coro_file(
-      shared_file_handle handle,
-      coro_io::ExecutorWrapper<> *executor =
-          coro_io::get_global_block_executor(),
-      std::string_view file_path = "")
-      : basic_random_coro_file(std::move(handle),
-                               executor->get_asio_executor(), file_path) {}
+  basic_random_coro_file(shared_file_handle handle,
+                         coro_io::ExecutorWrapper<> *executor =
+                             coro_io::get_global_block_executor(),
+                         std::string_view file_path = "")
+      : basic_random_coro_file(std::move(handle), executor->get_asio_executor(),
+                               file_path) {}
 
   basic_random_coro_file(shared_file_handle handle,
                          asio::io_context::executor_type executor,
@@ -487,8 +486,7 @@ class basic_random_coro_file {
     }
 
 #if defined(__APPLE__) || defined(__MACH__)
-    if (use_direct_io &&
-        fcntl(handle.native_handle(), F_NOCACHE, 1) != 0) {
+    if (use_direct_io && fcntl(handle.native_handle(), F_NOCACHE, 1) != 0) {
       return false;
     }
 #endif
@@ -532,7 +530,7 @@ class basic_random_coro_file {
 
     if constexpr (execute_type == execution_type::thread_pool) {
       co_return co_await async_pwrite(std::move(state), offset, buf.data(),
-                                     buf.size());
+                                      buf.size());
     }
     else {
 #if defined(ASIO_HAS_FILE)
@@ -542,7 +540,7 @@ class basic_random_coro_file {
       co_return std::make_pair(ec, write_size);
 #else
       co_return co_await async_pwrite(std::move(state), offset, buf.data(),
-                                     buf.size());
+                                      buf.size());
 #endif
     }
   }
@@ -587,8 +585,8 @@ class basic_random_coro_file {
     __cpp_lib_atomic_shared_ptr >= 201711L
     (void)state_.exchange({}, std::memory_order_acq_rel);
 #else
-    (void)std::atomic_exchange_explicit(
-        &state_, std::shared_ptr<file_state>{}, std::memory_order_acq_rel);
+    (void)std::atomic_exchange_explicit(&state_, std::shared_ptr<file_state>{},
+                                        std::memory_order_acq_rel);
 #endif
   }
 
@@ -611,13 +609,13 @@ class basic_random_coro_file {
           std::move(handle), executor_wrapper_.get_asio_executor());
 #if defined(ASIO_HAS_FILE)
       if constexpr (execute_type == execution_type::native_async) {
-        state->async_random_file = std::make_unique<asio::random_access_file>(
-            state->executor);
+        state->async_random_file =
+            std::make_unique<asio::random_access_file>(state->executor);
         std::error_code ec;
 #if defined(ASIO_WINDOWS)
-        auto native_handle = reinterpret_cast<
-            asio::random_access_file::native_handle_type>(
-            _get_osfhandle(state->handle.native_handle()));
+        auto native_handle =
+            reinterpret_cast<asio::random_access_file::native_handle_type>(
+                _get_osfhandle(state->handle.native_handle()));
         state->async_random_file->assign(native_handle, ec);
 #else
         state->async_random_file->assign(state->handle.native_handle(), ec);
@@ -713,20 +711,19 @@ class basic_random_coro_file {
                                  const_cast<char *>(data), size);
   }
 
-  static async_simple::coro::Lazy<std::pair<std::error_code, size_t>>
-  async_prw(std::shared_ptr<file_state> state, auto io_func, bool is_read,
-            size_t offset, char *buf, size_t size) {
+  static async_simple::coro::Lazy<std::pair<std::error_code, size_t>> async_prw(
+      std::shared_ptr<file_state> state, auto io_func, bool is_read,
+      size_t offset, char *buf, size_t size) {
     auto executor = state->executor;
     std::function<std::pair<std::error_code, size_t>()> operation =
         [state, io_func, offset, buf, size]() {
-          auto length = io_func(state->handle.native_handle(), buf, size,
-                                offset);
+          auto length =
+              io_func(state->handle.native_handle(), buf, size, offset);
           if (length < 0) {
-            return std::make_pair(
-                std::make_error_code(std::errc::io_error), size_t{0});
+            return std::make_pair(std::make_error_code(std::errc::io_error),
+                                  size_t{0});
           }
-          return std::make_pair(std::error_code{},
-                                static_cast<size_t>(length));
+          return std::make_pair(std::error_code{}, static_cast<size_t>(length));
         };
     auto result =
         co_await coro_io::post(std::move(operation), std::move(executor));
