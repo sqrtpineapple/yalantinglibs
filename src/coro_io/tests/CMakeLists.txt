@@ -15,5 +15,14 @@ if (CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND CMAKE_SYSTEM_NAME MATCHES "Windows"
 endif()
 add_test(NAME coro_io_test COMMAND coro_io_test)
 
+add_executable(coro_file_error_test
+        test_file_error_paths.cpp
+        main.cpp
+        )
+if (CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND CMAKE_SYSTEM_NAME MATCHES "Windows") # mingw-w64
+    target_link_libraries(coro_file_error_test PRIVATE ws2_32 mswsock)
+endif()
+add_test(NAME coro_file_error_test COMMAND coro_file_error_test)
+
 add_subdirectory(ibverbs)
 add_subdirectory(networkdirect)
