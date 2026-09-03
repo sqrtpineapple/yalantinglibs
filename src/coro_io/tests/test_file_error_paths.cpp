@@ -9,7 +9,6 @@
 #include <string>
 #include <string_view>
 #include <system_error>
-
 #include <ylt/coro_io/coro_file.hpp>
 #include <ylt/coro_io/shared_file_handle.hpp>
 
@@ -184,8 +183,8 @@ TEST_CASE("shared file handle rejects invalid descriptors") {
   CHECK(negative_duplicate.first == std::errc::bad_file_descriptor);
   CHECK_FALSE(negative_duplicate.second.valid());
 
-  auto closed_duplicate = coro_io::shared_file_handle::duplicate(
-      std::numeric_limits<int>::max());
+  auto closed_duplicate =
+      coro_io::shared_file_handle::duplicate(std::numeric_limits<int>::max());
   CHECK(closed_duplicate.first == std::errc::bad_file_descriptor);
   CHECK_FALSE(closed_duplicate.second.valid());
 }
