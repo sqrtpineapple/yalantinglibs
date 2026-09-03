@@ -111,14 +111,23 @@ bool fd_is_open(int fd) {
 #endif
 }
 
+std::ios::openmode runtime_open_mode(std::ios::openmode mode) {
+  volatile auto value = mode;
+  return value;
+}
+
 TEST_CASE("file open modes cover every flag mapping") {
-  CHECK(coro_io::to_flags(std::ios::app) == coro_io::flags::append);
-  CHECK(coro_io::to_flags(std::ios::trunc) == coro_io::flags::truncate);
-  CHECK(coro_io::to_flags(std::ios::trunc | std::ios::out) ==
+  CHECK(coro_io::to_flags(runtime_open_mode(std::ios::app)) ==
+        coro_io::flags::append);
+  CHECK(coro_io::to_flags(runtime_open_mode(std::ios::trunc)) ==
+        coro_io::flags::truncate);
+  CHECK(coro_io::to_flags(runtime_open_mode(std::ios::trunc | std::ios::out)) ==
         coro_io::flags::create_write_trunc);
-  CHECK(coro_io::to_flags(std::ios::in | std::ios::out | std::ios::trunc) ==
+  CHECK(coro_io::to_flags(runtime_open_mode(std::ios::in | std::ios::out |
+                                            std::ios::trunc)) ==
         coro_io::flags::create_read_write_trunc);
-  CHECK(coro_io::to_flags(std::ios::in | std::ios::out | std::ios::app) ==
+  CHECK(coro_io::to_flags(
+            runtime_open_mode(std::ios::in | std::ios::out | std::ios::app)) ==
         coro_io::flags::create_read_write_append);
 }
 
