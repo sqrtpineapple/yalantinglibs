@@ -150,8 +150,11 @@ TEST_CASE("sequential file reports failure states") {
   CHECK(write_result.second == 0);
 
   auto previous_severity = easylog::get_min_severity();
-  easylog::set_min_severity(easylog::Severity::INFO);
+  easylog::set_min_severity(easylog::Severity::WARN);
   seq_file missing;
+  CHECK_FALSE(missing.open("missing_directory/file", std::ios::in));
+
+  easylog::set_min_severity(easylog::Severity::INFO);
   CHECK_FALSE(missing.open("missing_directory/file", std::ios::in));
   easylog::set_min_severity(previous_severity);
 }
