@@ -2,7 +2,7 @@
 #include <doctest.h>
 #include <fcntl.h>
 
-#include <cstdlib>
+#include <cstdint>
 #include <filesystem>
 #include <fstream>
 #include <limits>
@@ -42,33 +42,41 @@ class fail_next_allocation {
 
 }  // namespace allocation_failure
 
-void *operator new(std::size_t size) {
+#if SIZE_MAX == UINT64_MAX
+extern "C" void *__real__Znwm(std::size_t size);
+extern "C" void *__real__Znam(std::size_t size);
+
+extern "C" void *__wrap__Znwm(std::size_t size) {
   if (allocation_failure::consume_failure()) {
     throw std::bad_alloc{};
   }
-  if (auto *ptr = std::malloc(size == 0 ? 1 : size)) {
-    return ptr;
-  }
-  throw std::bad_alloc{};
+  return __real__Znwm(size);
 }
 
-void *operator new[](std::size_t size) {
+extern "C" void *__wrap__Znam(std::size_t size) {
   if (allocation_failure::consume_failure()) {
     throw std::bad_alloc{};
   }
-  if (auto *ptr = std::malloc(size == 0 ? 1 : size)) {
-    return ptr;
+  return __real__Znam(size);
+}
+#elif SIZE_MAX == UINT32_MAX
+extern "C" void *__real__Znwj(std::size_t size);
+extern "C" void *__real__Znaj(std::size_t size);
+
+extern "C" void *__wrap__Znwj(std::size_t size) {
+  if (allocation_failure::consume_failure()) {
+    throw std::bad_alloc{};
   }
-  throw std::bad_alloc{};
+  return __real__Znwj(size);
 }
 
-void operator delete(void *ptr) noexcept { std::free(ptr); }
-
-void operator delete[](void *ptr) noexcept { std::free(ptr); }
-
-void operator delete(void *ptr, std::size_t) noexcept { std::free(ptr); }
-
-void operator delete[](void *ptr, std::size_t) noexcept { std::free(ptr); }
+extern "C" void *__wrap__Znaj(std::size_t size) {
+  if (allocation_failure::consume_failure()) {
+    throw std::bad_alloc{};
+  }
+  return __real__Znaj(size);
+}
+#endif
 
 namespace {
 
