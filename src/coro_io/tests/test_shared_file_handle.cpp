@@ -1,9 +1,11 @@
 #include <async_simple/coro/Collect.h>
 #include <async_simple/coro/SyncAwait.h>
 #include <doctest.h>
+#include <fcntl.h>
 
 #include <array>
 #include <asio/io_context.hpp>
+#include <cstdint>
 #include <filesystem>
 #include <fstream>
 #include <memory>
@@ -11,19 +13,29 @@
 #include <string_view>
 #include <system_error>
 #include <thread>
+#include <type_traits>
 #include <utility>
 #include <vector>
 #include <ylt/coro_io/coro_file.hpp>
 #include <ylt/coro_io/shared_file_handle.hpp>
 
-#if !defined(ASIO_WINDOWS)
-#include <fcntl.h>
+#if defined(ASIO_WINDOWS)
+#include <io.h>
+#include <windows.h>
+#else
 #include <sys/stat.h>
 #include <unistd.h>
+#endif
 
 namespace {
 
 namespace fs = std::filesystem;
+
+#if defined(ASIO_WINDOWS)
+constexpr int read_only_flag = _O_RDONLY;
+#else
+constexpr int read_only_flag = O_RDONLY;
+#endif
 
 class test_file {
  public:
@@ -44,7 +56,58 @@ class test_file {
   std::string path_;
 };
 
-bool is_fd_open(int fd) { return ::fcntl(fd, F_GETFD) != -1; }
+int open_read_only(const std::string &path) {
+#if defined(ASIO_WINDOWS)
+  return ::_open(path.c_str(), read_only_flag);
+#else
+  return ::open(path.c_str(), read_only_flag);
+#endif
+}
+
+void close_fd(int fd) {
+#if defined(ASIO_WINDOWS)
+  ::_close(fd);
+#else
+  ::close(fd);
+#endif
+}
+
+class file_descriptor_probe {
+ public:
+  explicit file_descriptor_probe(int fd)
+#if defined(ASIO_WINDOWS)
+      : handle_(::_get_osfhandle(fd)) {
+  }
+
+  bool is_open() const {
+    DWORD flags = 0;
+    return ::GetHandleInformation(reinterpret_cast<HANDLE>(handle_), &flags) !=
+           0;
+  }
+
+ private:
+  std::intptr_t handle_;
+#else
+      : fd_(fd) {
+  }
+
+  bool is_open() const { return ::fcntl(fd_, F_GETFD) != -1; }
+
+ private:
+  int fd_;
+#endif
+};
+
+#if defined(ASIO_WINDOWS)
+using windows_native_async_file =
+    coro_io::basic_random_coro_file<coro_io::execution_type::native_async>;
+using windows_thread_pool_file =
+    coro_io::basic_random_coro_file<coro_io::execution_type::thread_pool>;
+static_assert(!std::is_constructible_v<windows_native_async_file,
+                                       coro_io::shared_file_handle>);
+static_assert(std::is_constructible_v<windows_thread_pool_file,
+                                      coro_io::shared_file_handle>);
+#endif
 
 class io_context_runner {
  public:
@@ -93,11 +156,13 @@ void check_inflight_operation_retains_handle() {
   test_file source("shared_file_handle_inflight.tmp", content);
   test_file pressure("shared_file_handle_pressure.tmp", "other file");
 
-  auto open_result = coro_io::shared_file_handle::open(source.path(), O_RDONLY);
+  auto open_result =
+      coro_io::shared_file_handle::open(source.path(), read_only_flag);
   REQUIRE_FALSE(open_result.first);
   auto handle = std::move(open_result.second);
   REQUIRE(handle.valid());
   const int fd = handle.native_handle();
+  const file_descriptor_probe fd_probe(fd);
 
   asio::io_context io_context;
   auto file = std::make_unique<coro_io::basic_random_coro_file<execute_type>>(
@@ -115,12 +180,12 @@ void check_inflight_operation_retains_handle() {
 
   file.reset();
   handle = {};
-  REQUIRE(is_fd_open(fd));
+  REQUIRE(fd_probe.is_open());
   CHECK_FALSE(completed);
 
   std::vector<int> pressure_fds;
   for (size_t index = 0; index < 64; ++index) {
-    int pressure_fd = ::open(pressure.path().c_str(), O_RDONLY);
+    int pressure_fd = open_read_only(pressure.path());
     REQUIRE(pressure_fd >= 0);
     CHECK(pressure_fd != fd);
     pressure_fds.push_back(pressure_fd);
@@ -131,10 +196,10 @@ void check_inflight_operation_retains_handle() {
   CHECK_FALSE(result.first);
   CHECK(result.second == content.size());
   CHECK(std::string_view(buffer.data(), content.size()) == content);
-  CHECK_FALSE(is_fd_open(fd));
+  CHECK_FALSE(fd_probe.is_open());
 
   for (int pressure_fd : pressure_fds) {
-    ::close(pressure_fd);
+    close_fd(pressure_fd);
   }
 }
 
@@ -143,12 +208,13 @@ TEST_CASE("shared_file_handle lifetime and factories") {
 
   SUBCASE("open and weak handle") {
     auto open_result =
-        coro_io::shared_file_handle::open(source.path(), O_RDONLY);
+        coro_io::shared_file_handle::open(source.path(), read_only_flag);
     REQUIRE_FALSE(open_result.first);
     auto handle = std::move(open_result.second);
     REQUIRE(handle.valid());
 
     const int fd = handle.native_handle();
+    const file_descriptor_probe fd_probe(fd);
     auto weak = handle.weak();
     {
       auto copy = handle;
@@ -156,42 +222,44 @@ TEST_CASE("shared_file_handle lifetime and factories") {
       CHECK(weak.lock().native_handle() == fd);
     }
 
-    CHECK(is_fd_open(fd));
+    CHECK(fd_probe.is_open());
     handle = {};
     CHECK(weak.expired());
-    CHECK_FALSE(is_fd_open(fd));
+    CHECK_FALSE(fd_probe.is_open());
   }
 
   SUBCASE("adopt") {
-    int fd = ::open(source.path().c_str(), O_RDONLY);
+    int fd = open_read_only(source.path());
     REQUIRE(fd >= 0);
+    const file_descriptor_probe fd_probe(fd);
     {
       auto handle = coro_io::shared_file_handle::adopt(fd);
       REQUIRE(handle.valid());
       CHECK(handle.native_handle() == fd);
     }
-    CHECK_FALSE(is_fd_open(fd));
+    CHECK_FALSE(fd_probe.is_open());
   }
 
   SUBCASE("duplicate") {
-    int fd = ::open(source.path().c_str(), O_RDONLY);
+    int fd = open_read_only(source.path());
     REQUIRE(fd >= 0);
     auto duplicate_result = coro_io::shared_file_handle::duplicate(fd);
     REQUIRE_FALSE(duplicate_result.first);
     auto handle = std::move(duplicate_result.second);
     REQUIRE(handle.valid());
     const int duplicated_fd = handle.native_handle();
+    const file_descriptor_probe duplicated_fd_probe(duplicated_fd);
     CHECK(duplicated_fd != fd);
 
-    ::close(fd);
-    CHECK(is_fd_open(duplicated_fd));
+    close_fd(fd);
+    CHECK(duplicated_fd_probe.is_open());
     handle = {};
-    CHECK_FALSE(is_fd_open(duplicated_fd));
+    CHECK_FALSE(duplicated_fd_probe.is_open());
   }
 
   SUBCASE("open failure") {
     auto open_result = coro_io::shared_file_handle::open(
-        "shared_file_handle_missing/file", O_RDONLY);
+        "shared_file_handle_missing/file", read_only_flag);
     CHECK(open_result.first);
     CHECK_FALSE(open_result.second.valid());
   }
@@ -200,10 +268,12 @@ TEST_CASE("shared_file_handle lifetime and factories") {
 TEST_CASE("thread pool wrappers share one file descriptor") {
   const std::string content = "0123456789abcdefghijklmnopqrstuvwxyz";
   test_file source("shared_file_handle_thread_pool.tmp", content);
-  auto open_result = coro_io::shared_file_handle::open(source.path(), O_RDONLY);
+  auto open_result =
+      coro_io::shared_file_handle::open(source.path(), read_only_flag);
   REQUIRE_FALSE(open_result.first);
   auto handle = std::move(open_result.second);
   const int fd = handle.native_handle();
+  const file_descriptor_probe fd_probe(fd);
 
   asio::io_context io_context;
   io_context_runner runner(io_context);
@@ -224,7 +294,7 @@ TEST_CASE("thread pool wrappers share one file descriptor") {
   CHECK(std::string_view(first_buffer.data(), first_buffer.size()) == "012345");
 
   first.close();
-  CHECK(is_fd_open(fd));
+  CHECK(fd_probe.is_open());
 
   std::array<char, 6> second_buffer{};
   auto second_result = async_simple::coro::syncAwait(
@@ -234,12 +304,13 @@ TEST_CASE("thread pool wrappers share one file descriptor") {
         "6789ab");
 
   second.close();
-  CHECK_FALSE(is_fd_open(fd));
+  CHECK_FALSE(fd_probe.is_open());
 }
 
 TEST_CASE("closed random_coro_file rejects new operations") {
   test_file source("shared_file_handle_closed.tmp", "closed");
-  auto open_result = coro_io::shared_file_handle::open(source.path(), O_RDONLY);
+  auto open_result =
+      coro_io::shared_file_handle::open(source.path(), read_only_flag);
   REQUIRE_FALSE(open_result.first);
   auto handle = std::move(open_result.second);
 
@@ -259,7 +330,7 @@ TEST_CASE("thread pool operation retains handle after wrapper destruction") {
       coro_io::execution_type::thread_pool>();
 }
 
-#if defined(ASIO_HAS_FILE)
+#if defined(ASIO_HAS_FILE) && !defined(ASIO_WINDOWS)
 TEST_CASE("native async wrappers share one file descriptor") {
   constexpr size_t wrapper_count = 8;
   constexpr size_t read_size = 32;
@@ -269,10 +340,12 @@ TEST_CASE("native async wrappers share one file descriptor") {
   }
   test_file source("shared_file_handle_native_async.tmp", content);
 
-  auto open_result = coro_io::shared_file_handle::open(source.path(), O_RDONLY);
+  auto open_result =
+      coro_io::shared_file_handle::open(source.path(), read_only_flag);
   REQUIRE_FALSE(open_result.first);
   auto handle = std::move(open_result.second);
   const int fd = handle.native_handle();
+  const file_descriptor_probe fd_probe(fd);
 
   asio::io_context io_context;
   io_context_runner runner(io_context);
@@ -306,11 +379,11 @@ TEST_CASE("native async wrappers share one file descriptor") {
   }
 
   files.front()->close();
-  CHECK(is_fd_open(fd));
+  CHECK(fd_probe.is_open());
   files.clear();
-  CHECK(is_fd_open(fd));
+  CHECK(fd_probe.is_open());
   handle = {};
-  CHECK_FALSE(is_fd_open(fd));
+  CHECK_FALSE(fd_probe.is_open());
 }
 
 TEST_CASE("native async operation retains handle after wrapper destruction") {
@@ -320,4 +393,3 @@ TEST_CASE("native async operation retains handle after wrapper destruction") {
 #endif
 
 }  // namespace
-#endif

@@ -43,6 +43,7 @@
 #include <string>
 #include <string_view>
 #include <system_error>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -407,13 +408,19 @@ template <execution_type execute_type = execution_type::native_async>
 class basic_random_coro_file {
  private:
   struct file_state {
+    explicit file_state(asio::io_context::executor_type file_executor)
+        : executor(file_executor) {}
+
     file_state(shared_file_handle file_handle,
                asio::io_context::executor_type file_executor)
         : handle(std::move(file_handle)), executor(file_executor) {}
 
     ~file_state() noexcept {
 #if defined(ASIO_HAS_FILE)
-      if (async_random_file && async_random_file->is_open()) {
+      // Only release (detach without closing) when a shared handle owns the
+      // fd. On Windows native_async there is no shared handle, so let the asio
+      // file's destructor CloseHandle the overlapped HANDLE it created itself.
+      if (handle.valid() && async_random_file && async_random_file->is_open()) {
         std::error_code ec;
         (void)async_random_file->release(ec);
       }
@@ -423,10 +430,16 @@ class basic_random_coro_file {
     shared_file_handle handle;
     asio::io_context::executor_type executor;
 #if defined(ASIO_HAS_FILE)
-    std::unique_ptr<asio::random_access_file> async_random_file;
+    std::shared_ptr<asio::random_access_file> async_random_file;
 #endif
     std::atomic<bool> eof{false};
   };
+
+#if defined(ASIO_WINDOWS)
+  static constexpr bool supports_shared_native_async = false;
+#else
+  static constexpr bool supports_shared_native_async = true;
+#endif
 
  public:
   basic_random_coro_file(coro_io::ExecutorWrapper<> *executor =
@@ -450,6 +463,13 @@ class basic_random_coro_file {
     open(filepath, open_flags);
   }
 
+  /// Constructs a random-access file that shares ownership of a native file
+  /// descriptor. On Windows this overload is unavailable for native_async;
+  /// use the path-based overload so Asio can create an overlapped HANDLE.
+  template <execution_type type = execute_type,
+            std::enable_if_t<type != execution_type::native_async ||
+                                 supports_shared_native_async,
+                             int> = 0>
   basic_random_coro_file(shared_file_handle handle,
                          coro_io::ExecutorWrapper<> *executor =
                              coro_io::get_global_block_executor(),
@@ -457,6 +477,12 @@ class basic_random_coro_file {
       : basic_random_coro_file(std::move(handle), executor->get_asio_executor(),
                                file_path) {}
 
+  /// Constructs a shared-handle file using the specified executor. On Windows
+  /// shared_file_handle is supported only by the thread_pool backend.
+  template <execution_type type = execute_type,
+            std::enable_if_t<type != execution_type::native_async ||
+                                 supports_shared_native_async,
+                             int> = 0>
   basic_random_coro_file(shared_file_handle handle,
                          asio::io_context::executor_type executor,
                          std::string_view file_path = "")
@@ -470,6 +496,13 @@ class basic_random_coro_file {
     if (load_state()) {
       return true;
     }
+
+#if defined(ASIO_WINDOWS) && defined(ASIO_HAS_FILE)
+    if constexpr (execute_type == execution_type::native_async) {
+      return initialize_native_async_state(filepath, to_flags(open_flags),
+                                           use_direct_io);
+    }
+#endif
 
     int native_flags = to_flags(open_flags);
 #if defined(ASIO_WINDOWS)
@@ -547,7 +580,7 @@ class basic_random_coro_file {
 
   bool is_open() {
     auto state = load_state();
-    if (!state || !state->handle.valid()) {
+    if (!state) {
       return false;
     }
 
@@ -556,7 +589,7 @@ class basic_random_coro_file {
       return state->async_random_file && state->async_random_file->is_open();
     }
 #endif
-    return true;
+    return state->handle.valid();
   }
 
   bool eof() {
@@ -609,33 +642,53 @@ class basic_random_coro_file {
           std::move(handle), executor_wrapper_.get_asio_executor());
 #if defined(ASIO_HAS_FILE)
       if constexpr (execute_type == execution_type::native_async) {
-        state->async_random_file =
-            std::make_unique<asio::random_access_file>(state->executor);
-        std::error_code ec;
 #if defined(ASIO_WINDOWS)
-        auto native_handle =
-            reinterpret_cast<asio::random_access_file::native_handle_type>(
-                _get_osfhandle(state->handle.native_handle()));
-        state->async_random_file->assign(native_handle, ec);
+        return false;
 #else
+        state->async_random_file =
+            std::make_shared<asio::random_access_file>(state->executor);
+        std::error_code ec;
         state->async_random_file->assign(state->handle.native_handle(), ec);
-#endif
         if (ec) {
           return false;
         }
+#endif
       }
 #endif
-#if defined(__cpp_lib_atomic_shared_ptr) && \
-    __cpp_lib_atomic_shared_ptr >= 201711L
-      state_.store(std::move(state), std::memory_order_release);
-#else
-      std::atomic_store_explicit(&state_, std::move(state),
-                                 std::memory_order_release);
-#endif
+      store_state(std::move(state));
       return true;
     } catch (...) {
       return false;
     }
+  }
+
+#if defined(ASIO_WINDOWS) && defined(ASIO_HAS_FILE)
+  bool initialize_native_async_state(std::string_view filepath,
+                                     flags open_flags, bool use_direct_io) {
+    try {
+      auto state =
+          std::make_shared<file_state>(executor_wrapper_.get_asio_executor());
+      if (!open_native_async_file<false>(state->async_random_file,
+                                         executor_wrapper_, filepath,
+                                         open_flags, use_direct_io)) {
+        return false;
+      }
+      store_state(std::move(state));
+      return true;
+    } catch (...) {
+      return false;
+    }
+  }
+#endif
+
+  void store_state(std::shared_ptr<file_state> state) noexcept {
+#if defined(__cpp_lib_atomic_shared_ptr) && \
+    __cpp_lib_atomic_shared_ptr >= 201711L
+    state_.store(std::move(state), std::memory_order_release);
+#else
+    std::atomic_store_explicit(&state_, std::move(state),
+                               std::memory_order_release);
+#endif
   }
 
   std::shared_ptr<file_state> load_state() const noexcept {
