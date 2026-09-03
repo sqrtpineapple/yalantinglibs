@@ -20,10 +20,6 @@ if (CMAKE_SYSTEM_NAME STREQUAL "Linux")
             test_file_error_paths.cpp
             main.cpp
             )
-    target_link_options(coro_file_error_test PRIVATE
-            "-Wl,--wrap=_Znwm"
-            "-Wl,--wrap=_Znam"
-            )
     add_test(NAME coro_file_error_test COMMAND coro_file_error_test)
 endif()
 

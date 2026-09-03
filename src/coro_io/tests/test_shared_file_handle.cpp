@@ -279,9 +279,15 @@ TEST_CASE("thread pool wrappers share one file descriptor") {
   io_context_runner runner(io_context);
 
   coro_io::basic_random_coro_file<coro_io::execution_type::thread_pool> first(
-      handle, io_context.get_executor(), source.path());
+      handle, io_context.get_executor());
   coro_io::basic_random_coro_file<coro_io::execution_type::thread_pool> second(
       handle, io_context.get_executor(), source.path());
+  CHECK(first.file_path().empty());
+  CHECK(first.file_size() == content.size());
+  std::error_code file_size_error =
+      std::make_error_code(std::errc::invalid_argument);
+  CHECK(first.file_size(file_size_error) == content.size());
+  CHECK_FALSE(file_size_error);
 #if defined(__linux__)
   CHECK(count_file_descriptors_for_file(fd) == 1);
 #endif

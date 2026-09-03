@@ -364,7 +364,7 @@ class basic_seq_coro_file {
     return execution_type::none;
   }
 
-  size_t file_size(std::error_code ec) const noexcept {
+  size_t file_size(std::error_code &ec) const noexcept {
     return std::filesystem::file_size(file_path_, ec);
   }
 
@@ -623,11 +623,27 @@ class basic_random_coro_file {
 #endif
   }
 
-  size_t file_size(std::error_code ec) const noexcept {
+  size_t file_size(std::error_code &ec) const noexcept {
+    auto state = load_state();
+    if (state && state->handle.valid()) {
+      return file_size_from_handle(state->handle.native_handle(), ec);
+    }
     return std::filesystem::file_size(file_path_, ec);
   }
 
-  size_t file_size() const { return std::filesystem::file_size(file_path_); }
+  size_t file_size() const {
+    auto state = load_state();
+    if (!state || !state->handle.valid()) {
+      return std::filesystem::file_size(file_path_);
+    }
+
+    std::error_code ec;
+    auto size = file_size_from_handle(state->handle.native_handle(), ec);
+    if (ec) {
+      throw std::system_error(ec);
+    }
+    return size;
+  }
 
   std::string_view file_path() const { return file_path_; }
 
@@ -702,6 +718,22 @@ class basic_random_coro_file {
 
   static std::pair<std::error_code, size_t> bad_file_descriptor_result() {
     return {std::make_error_code(std::errc::bad_file_descriptor), 0};
+  }
+
+  static size_t file_size_from_handle(int fd, std::error_code &ec) noexcept {
+#if defined(ASIO_WINDOWS)
+    struct _stat64 status;
+    int result = ::_fstat64(fd, &status);
+#else
+    struct stat status;
+    int result = ::fstat(fd, &status);
+#endif
+    if (result != 0) {
+      ec = std::error_code(errno, std::generic_category());
+      return static_cast<size_t>(-1);
+    }
+    ec.clear();
+    return static_cast<size_t>(status.st_size);
   }
 
   static async_simple::coro::Lazy<std::pair<std::error_code, size_t>>

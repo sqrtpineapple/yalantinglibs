@@ -2,6 +2,7 @@
 #include <doctest.h>
 #include <fcntl.h>
 
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <limits>
@@ -41,21 +42,24 @@ class fail_next_allocation {
 
 }  // namespace allocation_failure
 
-extern "C" void *__real__Znwm(std::size_t size);
-extern "C" void *__real__Znam(std::size_t size);
-
-extern "C" void *__wrap__Znwm(std::size_t size) {
+void *operator new(std::size_t size) {
   if (allocation_failure::consume_failure()) {
     throw std::bad_alloc{};
   }
-  return __real__Znwm(size);
+  if (auto *ptr = std::malloc(size == 0 ? 1 : size)) {
+    return ptr;
+  }
+  throw std::bad_alloc{};
 }
 
-extern "C" void *__wrap__Znam(std::size_t size) {
+void *operator new[](std::size_t size) {
   if (allocation_failure::consume_failure()) {
     throw std::bad_alloc{};
   }
-  return __real__Znam(size);
+  if (auto *ptr = std::malloc(size == 0 ? 1 : size)) {
+    return ptr;
+  }
+  throw std::bad_alloc{};
 }
 
 namespace {
