@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
+#include <limits>
 #include <memory>
 #include <string>
 #include <string_view>
@@ -321,14 +322,34 @@ TEST_CASE("closed random_coro_file rejects new operations") {
   auto handle = std::move(open_result.second);
 
   coro_io::basic_random_coro_file<coro_io::execution_type::thread_pool> file(
-      handle);
+      handle, coro_io::get_global_block_executor(), source.path());
   file.close();
+
+  std::error_code file_size_error =
+      std::make_error_code(std::errc::invalid_argument);
+  CHECK(file.file_size(file_size_error) == 6);
+  CHECK_FALSE(file_size_error);
+  CHECK(file.file_size() == 6);
 
   char buffer{};
   auto read_result =
       async_simple::coro::syncAwait(file.async_read_at(0, &buffer, 1));
   CHECK(read_result.first == std::errc::bad_file_descriptor);
   CHECK(read_result.second == 0);
+}
+
+TEST_CASE("random_coro_file reports native handle size errors") {
+  auto handle = coro_io::shared_file_handle::adopt(
+      std::numeric_limits<
+          coro_io::shared_file_handle::native_handle_type>::max());
+  REQUIRE(handle.valid());
+
+  coro_io::basic_random_coro_file<coro_io::execution_type::thread_pool> file(
+      handle);
+  std::error_code ec;
+  CHECK(file.file_size(ec) == static_cast<size_t>(-1));
+  CHECK(ec == std::errc::bad_file_descriptor);
+  CHECK_THROWS_AS(file.file_size(), std::system_error);
 }
 
 TEST_CASE("thread pool operation retains handle after wrapper destruction") {
