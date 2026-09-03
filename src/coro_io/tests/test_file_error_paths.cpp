@@ -149,8 +149,11 @@ TEST_CASE("sequential file reports failure states") {
   CHECK(write_result.first == std::errc::io_error);
   CHECK(write_result.second == 0);
 
+  auto previous_severity = easylog::get_min_severity();
+  easylog::set_min_severity(easylog::Severity::INFO);
   seq_file missing;
   CHECK_FALSE(missing.open("missing_directory/file", std::ios::in));
+  easylog::set_min_severity(previous_severity);
 }
 
 TEST_CASE("random file reports invalid and failure states") {
