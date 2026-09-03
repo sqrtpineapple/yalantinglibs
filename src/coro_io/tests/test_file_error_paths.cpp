@@ -134,7 +134,7 @@ TEST_CASE("sequential file reports failure states") {
       coro_io::basic_seq_coro_file<coro_io::execution_type::thread_pool>;
 
   seq_file unopened;
-  CHECK_FALSE(unopened.seek(0));
+  CHECK_FALSE(unopened.seek(0, std::ios::beg));
   CHECK(unopened.get_execution_type() == coro_io::execution_type::none);
 
   test_file source("seq_failure.tmp", "content");
